@@ -1,0 +1,6 @@
+{
+  "name": "CinemaCast - Ultra HD Video Stream & Watch Party",
+  "description": "Stream local high-resolution 4K/HD video files with crystal-clear voice enhancement, high-bitrate stereo audio, ultra-low latency WebRTC streaming, and synced watch parties across laptops, phones, and tablets.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
