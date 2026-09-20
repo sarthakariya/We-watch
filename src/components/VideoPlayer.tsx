@@ -78,6 +78,7 @@ export function VideoPlayer({
   const [scrubberHoverTime, setScrubberHoverTime] = useState(0);
   const [scrubberHoverX, setScrubberHoverX] = useState(0);
   const [lastSyncedSequence, setLastSyncedSequence] = useState(-1);
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -88,15 +89,36 @@ export function VideoPlayer({
     }
   }, [onVideoElementReady]);
 
-  // Connect remote stream if viewer
+  // Connect remote stream if viewer with browser auto-play policy catch
   useEffect(() => {
     if (!isHost && videoRef.current && remoteStream) {
       videoRef.current.srcObject = remoteStream;
-      videoRef.current.play().catch((err) => {
-        console.warn('Auto-play blocked or waiting for user interaction:', err);
-      });
+      videoRef.current
+        .play()
+        .then(() => {
+          setNeedsAudioUnlock(false);
+        })
+        .catch(() => {
+          // If browser blocked unmuted autoplay, mute and try again, then prompt user to unmute
+          if (videoRef.current) {
+            videoRef.current.muted = true;
+            setIsMuted(true);
+            videoRef.current.play().catch(() => {});
+            setNeedsAudioUnlock(true);
+          }
+        });
     }
   }, [isHost, remoteStream]);
+
+  const unlockAudio = () => {
+    if (videoRef.current) {
+      videoRef.current.muted = false;
+      setIsMuted(false);
+      videoRef.current.volume = 1.0;
+      setVolume(1.0);
+      setNeedsAudioUnlock(false);
+    }
+  };
 
   // Handle Playback State Sync from Host to Viewer
   useEffect(() => {
@@ -269,6 +291,19 @@ export function VideoPlayer({
           <span className="inline-block px-3 py-1.5 rounded-lg bg-black/80 text-white font-medium text-sm sm:text-base md:text-lg backdrop-blur-sm border border-white/10 shadow-lg leading-snug">
             {subtitlesCueText}
           </span>
+        </div>
+      )}
+
+      {/* Tap to Unmute / Audio Autoplay Banner */}
+      {needsAudioUnlock && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-40 animate-bounce">
+          <button
+            onClick={unlockAudio}
+            className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold text-xs shadow-2xl border border-amber-300 transition-transform active:scale-95"
+          >
+            <Volume2 className="w-4 h-4" />
+            <span>Browser Muted Audio — Tap to Unmute Stream</span>
+          </button>
         </div>
       )}
 
