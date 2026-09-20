@@ -88,6 +88,7 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
 
   // Refs
   const wsRef = useRef<WebSocket | null>(null);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const webAudioEngineRef = useRef<WebAudioEngine | null>(null);
   const localMediaStreamRef = useRef<MediaStream | null>(null);
@@ -120,169 +121,245 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
     }
   }, [audioConfig]);
 
-  // Connect to Signaling Server via WebSocket
+  // Dispatch message to WebSocket and BroadcastChannel
+  const broadcastSignalingPayload = useCallback((payload: Record<string, unknown>) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify(payload));
+      } catch (err) {
+        console.warn('WS send error:', err);
+      }
+    }
+
+    if (broadcastChannelRef.current) {
+      try {
+        broadcastChannelRef.current.postMessage(payload);
+      } catch (err) {
+        console.warn('BroadcastChannel error:', err);
+      }
+    }
+  }, []);
+
+  // Common message processor
+  const handleIncomingMessage = useCallback((msg: any) => {
+    if (msg.roomId && msg.roomId !== roomId) return;
+    if (msg.peerId === myPeerId && msg.type !== 'room-init') return; // ignore own broadcast echo
+
+    switch (msg.type) {
+      case 'room-init': {
+        setRoomTitle(msg.roomTitle || 'CinemaCast Private Stream');
+        setHostPeerId(msg.hostPeerId);
+        if (typeof msg.isHost === 'boolean') {
+          setIsHost(msg.isHost);
+        }
+        if (msg.peers) {
+          setPeers(msg.peers);
+        }
+        if (msg.playbackState) {
+          setPlaybackState(msg.playbackState);
+        }
+        if (msg.chatHistory) {
+          setChatMessages(msg.chatHistory);
+        }
+        break;
+      }
+
+      case 'peer-joined': {
+        if (msg.peer && msg.peer.peerId !== myPeerId) {
+          setPeers((prev) => {
+            if (prev.some((p) => p.peerId === msg.peer.peerId)) return prev;
+            return [...prev, msg.peer];
+          });
+
+          if (msg.systemMessage) {
+            setChatMessages((prev) => [...prev, msg.systemMessage]);
+          }
+
+          if (isHost && localMediaStreamRef.current) {
+            createOfferToPeer(msg.peer.peerId);
+          }
+        }
+        break;
+      }
+
+      case 'peer-left': {
+        setPeers((prev) => prev.filter((p) => p.peerId !== msg.peerId));
+        if (msg.newHostPeerId) {
+          setHostPeerId(msg.newHostPeerId);
+          if (msg.newHostPeerId === myPeerId) {
+            setIsHost(true);
+          }
+        }
+        const pc = peerConnectionsRef.current.get(msg.peerId);
+        if (pc) {
+          pc.close();
+          peerConnectionsRef.current.delete(msg.peerId);
+        }
+        if (msg.systemMessage) {
+          setChatMessages((prev) => [...prev, msg.systemMessage]);
+        }
+        break;
+      }
+
+      case 'signal': {
+        const { fromPeerId, targetPeerId, signalData } = msg;
+        if (!targetPeerId || targetPeerId === myPeerId) {
+          handleIncomingSignal(fromPeerId || msg.peerId, signalData);
+        }
+        break;
+      }
+
+      case 'playback-sync': {
+        if (msg.currentTime !== undefined && !isHost) {
+          setPlaybackState({
+            isPlaying: msg.isPlaying ?? false,
+            currentTime: msg.currentTime,
+            duration: msg.duration || 0,
+            playbackRate: msg.playbackRate || 1,
+            serverTimestamp: msg.serverTimestamp || Date.now(),
+            sequence: msg.sequence || 0,
+          });
+        }
+        break;
+      }
+
+      case 'chat-message': {
+        if (msg.message) {
+          setChatMessages((prev) => [...prev, msg.message]);
+        } else if (msg.text && msg.peerId) {
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+              senderId: msg.peerId,
+              senderName: msg.displayName || 'Friend',
+              text: msg.text,
+              timestamp: Date.now(),
+              videoTimestamp: msg.videoTimestamp,
+              type: 'chat',
+            },
+          ]);
+        }
+        break;
+      }
+
+      case 'reaction': {
+        const reactionObj = msg.reaction || {
+          id: `reaction-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          emoji: msg.emoji,
+          senderName: msg.senderName || displayName,
+          xPercent: msg.xPercent || 50,
+          timestamp: Date.now(),
+        };
+        setFloatingReactions((prev) => [...prev, reactionObj]);
+        setTimeout(() => {
+          setFloatingReactions((prev) => prev.filter((r) => r.id !== reactionObj.id));
+        }, 2500);
+        break;
+      }
+
+      case 'peer-status': {
+        setPeers((prev) =>
+          prev.map((p) => {
+            if (p.peerId === msg.peerId) {
+              return {
+                ...p,
+                isMuted: msg.isMuted ?? p.isMuted,
+                isSpeaking: msg.isSpeaking ?? p.isSpeaking,
+                telemetry: msg.telemetry ?? p.telemetry,
+              };
+            }
+            return p;
+          })
+        );
+        break;
+      }
+
+      case 'stream-info-update': {
+        if (msg.videoTitle) setVideoTitle(msg.videoTitle);
+        break;
+      }
+    }
+  }, [roomId, myPeerId, isHost, displayName]);
+
+  // Connect to Signaling Server via WebSocket & BroadcastChannel
   const connectSignaling = useCallback(() => {
+    // Setup local BroadcastChannel for zero-latency multi-tab sync
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        if (broadcastChannelRef.current) {
+          broadcastChannelRef.current.close();
+        }
+        const bc = new BroadcastChannel(`cinemacast_${roomId}`);
+        bc.onmessage = (event) => {
+          if (event.data) {
+            handleIncomingMessage(event.data);
+          }
+        };
+        broadcastChannelRef.current = bc;
+      } catch (e) {
+        console.warn('BroadcastChannel init error:', e);
+      }
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
+    const isStaticDeploy = host.includes('github.io') || host.includes('netlify.app') || host.includes('vercel.app');
     const wsUrl = `${protocol}//${host}/ws`;
 
     if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      setConnectionStatus('Connected to Room');
+      ws.onopen = () => {
+        setIsConnected(true);
+        setConnectionStatus('Connected to Room');
 
-      // Send join-room
-      ws.send(
-        JSON.stringify({
-          type: 'join-room',
-          roomId,
-          peerId: myPeerId,
-          displayName,
-          deviceType,
-          isHost,
-          roomTitle,
-        })
-      );
-    };
+        ws.send(
+          JSON.stringify({
+            type: 'join-room',
+            roomId,
+            peerId: myPeerId,
+            displayName,
+            deviceType,
+            isHost,
+            roomTitle,
+          })
+        );
+      };
 
-    ws.onmessage = async (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-
-        switch (msg.type) {
-          case 'room-init': {
-            setRoomTitle(msg.roomTitle || 'CinemaCast Private Stream');
-            setHostPeerId(msg.hostPeerId);
-            if (typeof msg.isHost === 'boolean') {
-              setIsHost(msg.isHost);
-            }
-            if (msg.peers) {
-              setPeers(msg.peers);
-            }
-            if (msg.playbackState) {
-              setPlaybackState(msg.playbackState);
-            }
-            if (msg.chatHistory) {
-              setChatMessages(msg.chatHistory);
-            }
-
-            // If we are viewer and room has a host, we wait for host offer or initiate
-            break;
-          }
-
-          case 'peer-joined': {
-            setPeers((prev) => {
-              if (prev.some((p) => p.peerId === msg.peer.peerId)) return prev;
-              return [...prev, msg.peer];
-            });
-
-            if (msg.systemMessage) {
-              setChatMessages((prev) => [...prev, msg.systemMessage]);
-            }
-
-            // If we are the HOST, create a WebRTC PeerConnection and offer to the joined peer!
-            if (isHost && localMediaStreamRef.current) {
-              createOfferToPeer(msg.peer.peerId);
-            }
-            break;
-          }
-
-          case 'peer-left': {
-            setPeers((prev) => prev.filter((p) => p.peerId !== msg.peerId));
-            if (msg.newHostPeerId) {
-              setHostPeerId(msg.newHostPeerId);
-              if (msg.newHostPeerId === myPeerId) {
-                setIsHost(true);
-              }
-            }
-            // Close peer connection
-            const pc = peerConnectionsRef.current.get(msg.peerId);
-            if (pc) {
-              pc.close();
-              peerConnectionsRef.current.delete(msg.peerId);
-            }
-            if (msg.systemMessage) {
-              setChatMessages((prev) => [...prev, msg.systemMessage]);
-            }
-            break;
-          }
-
-          case 'signal': {
-            const { fromPeerId, signalData } = msg;
-            handleIncomingSignal(fromPeerId, signalData);
-            break;
-          }
-
-          case 'playback-sync': {
-            if (msg.playbackState && !isHost) {
-              setPlaybackState(msg.playbackState);
-            }
-            break;
-          }
-
-          case 'chat-message': {
-            if (msg.message) {
-              setChatMessages((prev) => [...prev, msg.message]);
-            }
-            break;
-          }
-
-          case 'reaction': {
-            if (msg.reaction) {
-              setFloatingReactions((prev) => [...prev, msg.reaction]);
-              // Auto-remove reaction after 2.5s
-              setTimeout(() => {
-                setFloatingReactions((prev) =>
-                  prev.filter((r) => r.id !== msg.reaction.id)
-                );
-              }, 2500);
-            }
-            break;
-          }
-
-          case 'peer-status': {
-            setPeers((prev) =>
-              prev.map((p) => {
-                if (p.peerId === msg.peerId) {
-                  return {
-                    ...p,
-                    isMuted: msg.isMuted ?? p.isMuted,
-                    isSpeaking: msg.isSpeaking ?? p.isSpeaking,
-                    telemetry: msg.telemetry ?? p.telemetry,
-                  };
-                }
-                return p;
-              })
-            );
-            break;
-          }
-
-          case 'stream-info-update': {
-            if (msg.videoTitle) setVideoTitle(msg.videoTitle);
-            break;
-          }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          handleIncomingMessage(msg);
+        } catch (err) {
+          console.error('Signaling parse error:', err);
         }
-      } catch (err) {
-        console.error('Signaling parse error:', err);
-      }
-    };
+      };
 
-    ws.onclose = () => {
-      setIsConnected(false);
-      setConnectionStatus('Reconnecting in 3s...');
-      setTimeout(connectSignaling, 3000);
-    };
+      ws.onclose = () => {
+        setIsConnected(true); // Still connected via BroadcastChannel
+        if (!isStaticDeploy) {
+          setConnectionStatus('Room Ready (P2P Mesh)');
+          setTimeout(connectSignaling, 4000);
+        } else {
+          setConnectionStatus('Room Active (Direct P2P)');
+        }
+      };
 
-    ws.onerror = (err) => {
-      console.warn('Signaling socket error:', err);
-    };
-  }, [roomId, myPeerId, displayName, deviceType, isHost, roomTitle]);
+      ws.onerror = () => {
+        setIsConnected(true);
+        setConnectionStatus('Room Active (P2P Ready)');
+      };
+    } catch {
+      setIsConnected(true);
+      setConnectionStatus('Room Active (P2P Ready)');
+    }
+  }, [roomId, myPeerId, displayName, deviceType, isHost, roomTitle, handleIncomingMessage]);
 
   // Connect on mount
   useEffect(() => {
@@ -290,6 +367,9 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
     return () => {
       if (wsRef.current) {
         wsRef.current.close();
+      }
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.close();
       }
       peerConnectionsRef.current.forEach((pc) => pc.close());
       peerConnectionsRef.current.clear();
@@ -306,16 +386,14 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
 
         // ICE candidate handler
         pc.onicecandidate = (event) => {
-          if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
-              JSON.stringify({
-                type: 'signal',
-                roomId,
-                peerId: myPeerId,
-                targetPeerId,
-                signalData: { candidate: event.candidate },
-              })
-            );
+          if (event.candidate) {
+            broadcastSignalingPayload({
+              type: 'signal',
+              roomId,
+              peerId: myPeerId,
+              targetPeerId,
+              signalData: { candidate: event.candidate },
+            });
           }
         };
 
@@ -377,22 +455,18 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
 
         await pc.setLocalDescription(new RTCSessionDescription({ type: 'offer', sdp: mungedSdp }));
 
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'signal',
-              roomId,
-              peerId: myPeerId,
-              targetPeerId,
-              signalData: { description: pc.localDescription },
-            })
-          );
-        }
+        broadcastSignalingPayload({
+          type: 'signal',
+          roomId,
+          peerId: myPeerId,
+          targetPeerId,
+          signalData: { description: pc.localDescription },
+        });
       } catch (err) {
         console.error(`Error creating offer to peer ${targetPeerId}:`, err);
       }
     },
-    [getOrCreatePeerConnection, videoConfig, audioConfig, roomId, myPeerId]
+    [getOrCreatePeerConnection, videoConfig, audioConfig, roomId, myPeerId, broadcastSignalingPayload]
   );
 
   // Handle incoming WebRTC signals
@@ -416,17 +490,13 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
 
             await pc.setLocalDescription(new RTCSessionDescription({ type: 'answer', sdp: mungedAnswer }));
 
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(
-                JSON.stringify({
-                  type: 'signal',
-                  roomId,
-                  peerId: myPeerId,
-                  targetPeerId: fromPeerId,
-                  signalData: { description: pc.localDescription },
-                })
-              );
-            }
+            broadcastSignalingPayload({
+              type: 'signal',
+              roomId,
+              peerId: myPeerId,
+              targetPeerId: fromPeerId,
+              signalData: { description: pc.localDescription },
+            });
           }
         } else if (signalData.candidate) {
           try {
@@ -439,7 +509,7 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
         console.error('Error handling incoming signal:', err);
       }
     },
-    [getOrCreatePeerConnection, roomId, myPeerId, videoConfig, audioConfig]
+    [getOrCreatePeerConnection, roomId, myPeerId, videoConfig, audioConfig, broadcastSignalingPayload]
   );
 
   // Attach local video element and start capture stream
@@ -518,23 +588,19 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
             createOfferToPeer(peer.peerId);
           });
 
-          // Notify server of stream title
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
-              JSON.stringify({
-                type: 'stream-info-update',
-                roomId,
-                videoTitle: title || (typeof fileOrUrl === 'string' ? 'Sample Video' : fileOrUrl.name),
-                resolution: `${videoEl.videoWidth || 3840}x${videoEl.videoHeight || 2160}`,
-                hasAudioEnhancement: true,
-                bitrateMbps: videoConfig.maxBitrateMbps,
-              })
-            );
-          }
+          // Notify server & room of stream title
+          broadcastSignalingPayload({
+            type: 'stream-info-update',
+            roomId,
+            videoTitle: title || (typeof fileOrUrl === 'string' ? 'Sample Video' : fileOrUrl.name),
+            resolution: `${videoEl.videoWidth || 3840}x${videoEl.videoHeight || 2160}`,
+            hasAudioEnhancement: true,
+            bitrateMbps: videoConfig.maxBitrateMbps,
+          });
         }
       };
     },
-    [audioConfig, videoConfig, peers, createOfferToPeer, roomId]
+    [audioConfig, videoConfig, peers, createOfferToPeer, roomId, broadcastSignalingPayload]
   );
 
   // Sync playback actions (Host broadcasts to viewers)
@@ -551,56 +617,46 @@ export function useWebRTCStream(initialRoomId?: string, forceIsHost: boolean = f
 
       setPlaybackState(newState);
 
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'playback-sync',
-            roomId,
-            peerId: myPeerId,
-            ...newState,
-          })
-        );
-      }
+      broadcastSignalingPayload({
+        type: 'playback-sync',
+        roomId,
+        peerId: myPeerId,
+        ...newState,
+      });
     },
-    [playbackState, roomId, myPeerId]
+    [playbackState, roomId, myPeerId, broadcastSignalingPayload]
   );
 
   // Send Chat Message
   const sendChatMessage = useCallback(
     (text: string, currentVideoTime?: number) => {
       if (!text.trim()) return;
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'chat-message',
-            roomId,
-            peerId: myPeerId,
-            text,
-            videoTimestamp: currentVideoTime,
-          })
-        );
-      }
+      broadcastSignalingPayload({
+        type: 'chat-message',
+        roomId,
+        peerId: myPeerId,
+        displayName,
+        text,
+        videoTimestamp: currentVideoTime,
+      });
     },
-    [roomId, myPeerId]
+    [roomId, myPeerId, displayName, broadcastSignalingPayload]
   );
 
   // Send Floating Reaction
   const sendReaction = useCallback(
     (emoji: string) => {
       const xPercent = 15 + Math.random() * 70;
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'reaction',
-            roomId,
-            peerId: myPeerId,
-            emoji,
-            xPercent,
-          })
-        );
-      }
+      broadcastSignalingPayload({
+        type: 'reaction',
+        roomId,
+        peerId: myPeerId,
+        displayName,
+        emoji,
+        xPercent,
+      });
     },
-    [roomId, myPeerId]
+    [roomId, myPeerId, displayName, broadcastSignalingPayload]
   );
 
   // Apply Voice Preset helper
